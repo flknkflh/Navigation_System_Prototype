@@ -1,0 +1,37 @@
+import geopandas as gpd
+from shapely.geometry import box
+
+# ================= LOAD DATA ASLI =================
+shp_path = "KODIKLATTNI/KODIKLATTNI.shp"
+gdf = gpd.read_file(shp_path)
+
+print("Jumlah data asli:", len(gdf))
+# ================= FIX CRS JIKA KOSONG =================
+if gdf.crs is None:
+    print("CRS tidak ada! Diset ke EPSG:4326 (WGS84)")
+    gdf = gdf.set_crs(epsg=4326)
+
+utm_epsg = int(input("Masukkan EPSG UTM Indonesia (contoh 32748): "))
+gdf = gdf.to_crs(epsg=utm_epsg)
+
+print("CRS sekarang:", gdf.crs)
+
+# ================= BATAS KOORDINAT =================
+# ================= BATAS KOORDINAT =================
+minx = 677738.12
+maxx = 681738.12
+miny = 9293056.22
+maxy = 9297056.22
+
+bbox = box(minx, miny, maxx, maxy)
+
+# ================= FILTER DATA =================
+gdf_crop = gdf[gdf.intersects(bbox)]
+
+print("Jumlah data hasil crop:", len(gdf_crop))
+
+# ================= SIMPAN SHAPEFILE BARU =================
+output_path = "KODIKLATTNI_crop/KODIKLATTNI_crop.shp"
+gdf_crop.to_file(output_path)
+
+print("✅ Shapefile baru berhasil dibuat:", output_path)
