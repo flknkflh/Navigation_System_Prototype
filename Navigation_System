@@ -1,0 +1,1076 @@
+import geopandas as gpd
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+import contextily as ctx
+from shapely.geometry import Point, LineString, Polygon   # <<< TAMBAHAN
+from datetime import datetime
+from scipy.interpolate import griddata
+
+# ================== LOAD PETA ==================
+
+shp_path = "KODIKLATTNI_crop/KODIKLATTNI_crop.shp"
+gdf = gpd.read_file(shp_path)
+
+print("CRS awal:", gdf.crs)
+
+minx = 677738.12
+maxx = 681738.12
+miny = 9293056.22
+maxy = 9297056.22
+
+def preprocess_shapefile(input_shp, output_shp, bbox=None, polygon=None):
+
+    gdf = gpd.read_file(input_shp)
+
+    if bbox is not None:
+        minx, miny, maxx, maxy = bbox
+        area = box(minx, miny, maxx, maxy)
+        gdf = gdf[gdf.intersects(area)]
+
+    if polygon is not None:
+        gdf = gdf[gdf.intersects(polygon)]
+
+    gdf.to_file(output_shp)
+
+    print("✅ Preprocess selesai:", output_shp)
+    
+preprocess_shapefile(shp_path, "KODIKLATTNI/KODIKLATTNI.shp",bbox=None, polygon=None)
+
+slope_maks = 5
+# ================== RINTANGAN ==================
+rintangan_list = []   # <<< TAMBAHAN
+penanda_list = []
+# ================== DISKRETISASI ==================
+
+diskret_points = []
+grid_n = 0
+grid_m = 0
+buffer_rintangan = 50   # meter radius sekitar rintangan
+
+def utm_ke_longlat(point):
+
+    gseries = gpd.GeoSeries([point], crs=gdf.crs)
+    gseries_ll = gseries.to_crs(epsg=4326)
+
+    lon = gseries_ll.geometry[0].x
+    lat = gseries_ll.geometry[0].y
+
+    return lat, lon
+    
+def buat_grid_diskret(n, m):
+
+    global diskret_points, grid_n, grid_m
+
+    grid_n = n
+    grid_m = m
+
+    xs = np.linspace(minx, maxx, n)
+    ys = np.linspace(miny, maxy, m)
+
+    diskret_points = []
+
+    for x in xs:
+        for y in ys:
+
+            p = Point(x, y)
+
+            lat, lon = utm_ke_longlat(p)
+
+            elev = ambil_elevasi_terdekat(x, y)
+
+            diskret_points.append({
+                "point": p,
+                "x": x,
+                "y": y,
+                "lat": lat,
+                "lon": lon,
+                "elevasi": elev,
+                "status": "AMAN"
+            })
+
+    print(f"✅ Grid diskretisasi dibuat: {n} x {m} = {len(diskret_points)} titik")
+
+def update_status_diskret():
+
+    global diskret_points
+
+    for data in diskret_points:
+
+        p = data["point"]
+        status = "AMAN"
+
+        # ===== CEK PENANDA BAHAYA =====
+        for poly, warna, label in penanda_list:
+
+            if label == "BAHAYA":
+                if poly.contains(p):
+                    status = "BAHAYA"
+
+        # ===== CEK RINTANGAN =====
+        for jenis, obj in rintangan_list:
+
+            if jenis == "titik":
+                if p.distance(obj) <= buffer_rintangan:
+                    status = "RINTANGAN"
+
+            elif jenis == "garis":
+                if p.distance(obj) <= buffer_rintangan:
+                    status = "RINTANGAN"
+
+            elif jenis == "luas":
+                if obj.contains(p):
+                    status = "RINTANGAN"
+
+        data["status"] = status
+        
+def tandai_titik_curam():
+
+    global diskret_points
+
+    print("⚡ Analisis slope medan...")
+
+    grid_map = {}
+    idx = 0
+
+    for i in range(grid_n):
+        for j in range(grid_m):
+            grid_map[(i, j)] = diskret_points[idx]
+            idx += 1
+
+    for i in range(grid_n):
+        for j in range(grid_m):
+
+            p = grid_map[(i, j)]
+
+            elev = p["elevasi"]
+
+            bahaya = False
+
+            for dx in [-1,0,1]:
+                for dy in [-1,0,1]:
+
+                    if dx == 0 and dy == 0:
+                        continue
+
+                    ni = i + dx
+                    nj = j + dy
+
+                    if (ni, nj) in grid_map:
+
+                        elev2 = grid_map[(ni, nj)]["elevasi"]
+
+                        if abs(elev - elev2) > slope_maks:
+
+                            bahaya = True
+                            break
+
+                if bahaya:
+                    break
+
+            if bahaya:
+                p["status"] = "BAHAYA"
+                
+def cari_grid_terdekat(x, y):
+
+    min_d = 1e12
+    best = None
+
+    for d in diskret_points:
+
+        dist = math.hypot(d["x"] - x, d["y"] - y)
+
+        if dist < min_d:
+            min_d = dist
+            best = d
+
+    return best
+
+import heapq
+
+def cari_jalur_aman(start, goal):
+
+    print("⚡ Mencari jalur aman...")
+
+    # buat matriks index
+    grid_map = {}
+    coord_map = {}
+
+    idx = 0
+    for i in range(grid_n):
+        for j in range(grid_m):
+
+            grid_map[(i,j)] = diskret_points[idx]
+            coord_map[diskret_points[idx]["point"]] = (i,j)
+
+            idx += 1
+
+    def heuristic(a, b):
+        return math.hypot(a[0]-b[0], a[1]-b[1])
+
+    start_idx = coord_map[start["point"]]
+    goal_idx = coord_map[goal["point"]]
+
+    open_set = []
+    heapq.heappush(open_set, (0, start_idx))
+
+    came_from = {}
+    gscore = {start_idx:0}
+
+    while open_set:
+
+        _, current = heapq.heappop(open_set)
+
+        if current == goal_idx:
+            break
+
+        i,j = current
+
+        for dx in [-1,0,1]:
+            for dy in [-1,0,1]:
+
+                ni = i + dx
+                nj = j + dy
+
+                if (ni,nj) not in grid_map:
+                    continue
+
+                neighbor = grid_map[(ni,nj)]
+
+                if neighbor["status"] != "AMAN":
+                    continue
+
+                tentative = gscore[current] + heuristic((i,j),(ni,nj))
+
+                if (ni,nj) not in gscore or tentative < gscore[(ni,nj)]:
+
+                    gscore[(ni,nj)] = tentative
+                    fscore = tentative + heuristic((ni,nj), goal_idx)
+
+                    heapq.heappush(open_set, (fscore, (ni,nj)))
+                    came_from[(ni,nj)] = current
+
+    # rekonstruksi jalur
+    path = []
+    cur = goal_idx
+
+    while cur in came_from:
+        path.append(grid_map[cur]["point"])
+        cur = came_from[cur]
+
+    path.append(start["point"])
+    path.reverse()
+
+    print("✅ Jalur ditemukan")
+
+    return path
+
+    
+def simpan_csv_diskret(nama_file="diskretisasi.csv"):
+
+    import pandas as pd
+
+    rows = []
+
+    for d in diskret_points:
+
+       rows.append({
+            "x": d["x"],
+            "y": d["y"],
+            "latitude": d["lat"],
+            "longitude": d["lon"],
+            "elevasi": d["elevasi"],
+            "status": d["status"]
+        })
+
+    df = pd.DataFrame(rows)
+
+    df.to_csv(nama_file, index=False)
+
+    print(f"✅ CSV disimpan: {nama_file}")
+
+print("\n=== PARAMETER MEDAN ===")
+while True:
+    try:
+        slope_maks = float(input("Batas slope maksimum aman (meter beda elevasi antar grid): "))
+        if slope_maks > 0:
+            break
+    except:
+        print("❌ Input salah")
+    
+# ================= FIX CRS JIKA KOSONG =================
+if gdf.crs is None:
+    print("CRS tidak ada! Diset ke EPSG:4326 (WGS84)")
+    gdf = gdf.set_crs(epsg=4326)
+
+utm_epsg = int(input("Masukkan EPSG UTM Indonesia (contoh 32748): "))
+gdf = gdf.to_crs(epsg=utm_epsg)
+
+print("CRS sekarang:", gdf.crs)
+
+# ================== OPTIMASI DATA SHP ==================
+def optimasi_elevasi(gdf, persen=0.2):
+
+    print("\n⚡ Optimasi data elevasi...")
+
+    if gdf.geometry.iloc[0].geom_type != "Point":
+        gdf["geometry"] = gdf.geometry.centroid
+
+    n = len(gdf)
+    ambil = max(50, int(n * persen))
+
+    mean_x = gdf.geometry.x.mean()
+    mean_y = gdf.geometry.y.mean()
+
+    std_x = gdf.geometry.x.std()
+    std_y = gdf.geometry.y.std()
+
+    prob = np.exp(-(((gdf.geometry.x - mean_x)**2)/(2*std_x**2) +
+                    ((gdf.geometry.y - mean_y)**2)/(2*std_y**2)))
+
+    prob = prob / prob.sum()
+
+    gdf_sample = gdf.sample(n=ambil, weights=prob, random_state=42)
+
+    print(f"Data asli  : {n}")
+    print(f"Data pakai : {len(gdf_sample)} ({persen*100:.0f}%)")
+
+    return gdf_sample
+
+# ================== SIAPKAN DATA ELEVASI UNTUK GRID ==================
+
+from scipy.spatial import cKDTree
+
+print("⚡ Membuat index elevasi...")
+
+elev_xy = np.vstack([gdf.geometry.x.values,
+                     gdf.geometry.y.values]).T
+
+elev_z = gdf["grid_code"].values
+
+elev_tree = cKDTree(elev_xy)
+
+print("✅ Index elevasi siap")
+
+def ambil_elevasi_terdekat(x, y):
+
+    dist, idx = elev_tree.query([x, y])
+
+    return elev_z[idx]
+    
+# ====== OPTIMASI DIPANGGIL ======
+gdf = optimasi_elevasi(gdf, persen=0.2)
+
+gdf_web = gdf.to_crs(epsg=3857)
+
+minx, miny, maxx, maxy = gdf.total_bounds
+minx_web, miny_web, maxx_web, maxy_web = gdf_web.total_bounds
+
+print("\n=== BATAS KOORDINAT PETA ===")
+print(f"X dari {minx:.2f} sampai {maxx:.2f}")
+print(f"Y dari {miny:.2f} sampai {maxy:.2f}")
+
+# ================== HITUNG BATAS LONG LAT ==================
+
+def utm_to_latlon_xy(x, y):
+
+    point = gpd.GeoSeries([Point(x, y)], crs=gdf.crs)
+    point_ll = point.to_crs(epsg=4326)
+
+    lon = point_ll.geometry[0].x
+    lat = point_ll.geometry[0].y
+
+    return lat, lon
+
+
+lat_min, lon_min = utm_to_latlon_xy(minx, miny)
+lat_max, lon_max = utm_to_latlon_xy(maxx, maxy)
+
+
+print("\n=== BATAS LONG LAT YANG VALID ===")
+print(f"Latitude  : {lat_min:.6f} s/d {lat_max:.6f}")
+print(f"Longitude : {lon_min:.6f} s/d {lon_max:.6f}")
+print("Semua input koordinat harus berada dalam rentang ini.\n")
+
+# ================== INPUT GRID DISKRETISASI WAJIB ==================
+
+print("\n=== DISKRETISASI AREA ===")
+
+while True:
+    try:
+        grid_n = int(input("Jumlah grid arah X (contoh 50): "))
+        grid_m = int(input("Jumlah grid arah Y (contoh 50): "))
+
+        if grid_n > 0 and grid_m > 0:
+            break
+        else:
+            print("❌ Harus > 0")
+
+    except:
+        print("❌ Input salah")
+
+buat_grid_diskret(grid_n, grid_m)
+update_status_diskret()
+tandai_titik_curam()   # <<< TAMBAHAN WAJIB
+
+print("✅ Diskretisasi siap digunakan\n")
+
+
+# ================== FUNGSI ==================
+
+def validasi_titik(x, y):
+    if x < minx or x > maxx or y < miny or y > maxy:
+        print("❌ KOORDINAT DI LUAR PETA!")
+        return False
+    return True
+
+def validasi_azimuth(az):
+    if az < 0 or az > 360:
+        print("❌ AZIMUTH HARUS 0 - 360 DERAJAT!")
+        return False
+    return True
+    
+# ================= TAMBAHAN KONVERSI =================
+def longlat_ke_utm(lat, lon):
+
+    point_ll = gpd.GeoSeries([Point(lon, lat)], crs="EPSG:4326")
+    point_utm = point_ll.to_crs(gdf.crs)
+
+    p = point_utm.geometry[0]
+
+    if not validasi_titik(p.x, p.y):
+        return None
+
+    return p
+
+
+# ================= URUT POLYGON =================
+def urutkan_polygon(titik):
+
+    cx = np.mean([p.x for p in titik])
+    cy = np.mean([p.y for p in titik])
+
+    def angle(p):
+        return math.atan2(p.y - cy, p.x - cx)
+
+    return sorted(titik, key=angle)
+
+
+# ================= TAMBAH RINTANGAN =================
+def tambah_rintangan():
+
+    print("\n=== TAMBAH RINTANGAN ===")
+    print("1. Titik")
+    print("2. Garis")
+    print("3. Luas / Polygon")
+
+    jenis = input("Pilih jenis: ")
+
+    # ================= TITIK =================
+    if jenis == "1":
+
+        while True:
+            lat = float(input("Latitude: "))
+            lon = float(input("Longitude: "))
+
+            p = longlat_ke_utm(lat, lon)
+
+            if p:
+                rintangan_list.append(("titik", p))
+                break
+            else:
+                print("❌ Koordinat salah, ulangi!")
+
+    # ================= GARIS =================
+    elif jenis == "2":
+
+        titik = []
+
+        for i in range(2):
+
+            while True:
+                print(f"Titik {i+1}")
+
+                lat = float(input("Latitude: "))
+                lon = float(input("Longitude: "))
+
+                p = longlat_ke_utm(lat, lon)
+
+                if p:
+                    titik.append(p)
+                    break
+                else:
+                    print("❌ Koordinat salah, ulangi!")
+
+        garis = LineString(titik)
+        rintangan_list.append(("garis", garis))
+
+    # ================= POLYGON =================
+    elif jenis == "3":
+
+        while True:
+            n = int(input("Jumlah titik >=3: "))
+            if n >= 3:
+                break
+            else:
+                print("❌ Minimal 3 titik!")
+
+        titik = []
+
+        for i in range(n):
+
+            while True:
+                print(f"Titik {i+1}")
+
+                lat = float(input("Latitude: "))
+                lon = float(input("Longitude: "))
+
+                p = longlat_ke_utm(lat, lon)
+
+                if p:
+                    titik.append(p)
+                    break
+                else:
+                    print("❌ Koordinat salah, ulangi!")
+
+        titik = urutkan_polygon(titik)
+
+        poly = Polygon(titik)
+
+        rintangan_list.append(("luas", poly))
+
+    else:
+        print("❌ Pilihan tidak valid!")
+        return
+
+    print("✅ Rintangan ditambahkan!")
+
+# ================= TAMBAH PENANDA DAERAH =================
+def tambah_penanda_daerah():
+
+    print("\n=== PENANDA DAERAH ===")
+    print("1. Aman (Hijau)")
+    print("2. Hati-hati (Kuning)")
+    print("3. Bahaya (Merah)")
+
+    pilihan = input("Pilih jenis: ")
+
+    if pilihan == "1":
+        warna = "green"
+        label = "AMAN"
+
+    elif pilihan == "2":
+        warna = "yellow"
+        label = "HATI-HATI"
+
+    elif pilihan == "3":
+        warna = "red"
+        label = "BAHAYA"
+
+    else:
+        print("❌ Pilihan tidak valid!")
+        return
+
+    while True:
+        n = int(input("Jumlah titik >=3: "))
+        if n >= 3:
+            break
+        else:
+            print("❌ Minimal 3 titik!")
+
+    titik = []
+
+    for i in range(n):
+
+        while True:
+
+            print(f"Titik {i+1}")
+
+            lat = float(input("Latitude: "))
+            lon = float(input("Longitude: "))
+
+            p = longlat_ke_utm(lat, lon)
+
+            if p:
+                titik.append(p)
+                break
+            else:
+                print("❌ Koordinat di luar batas! Ulangi!")
+
+    # ===== URUTKAN OTOMATIS =====
+    titik = urutkan_polygon(titik)
+
+    poly = Polygon(titik)
+
+    penanda_list.append((poly, warna, label))
+
+    print("✅ Penanda berhasil ditambahkan!")
+    
+def hitung_azimuth_jarak(x1, y1, x2, y2):
+    dx = x2 - x1
+    dy = y2 - y1
+    jarak = math.sqrt(dx**2 + dy**2)
+
+    azimuth_rad = math.atan2(dx, dy)
+    azimuth_deg = math.degrees(azimuth_rad)
+
+    if azimuth_deg < 0:
+        azimuth_deg += 360
+
+    azimuth_mil = azimuth_deg * (6400 / 360)
+
+    return azimuth_deg, azimuth_mil, jarak
+
+
+def back_azimuth(az):
+    baz = az + 180
+    if baz >= 360:
+        baz -= 360
+    return baz
+
+
+def intersection(p1, az1, p2, az2):
+
+    az1 = math.radians(az1)
+    az2 = math.radians(az2)
+
+    A = np.array([
+        [math.sin(az1), -math.sin(az2)],
+        [math.cos(az1), -math.cos(az2)]
+    ])
+
+    b = np.array([p2[0] - p1[0], p2[1] - p1[1]])
+
+    t = np.linalg.solve(A, b)
+
+    x = p1[0] + t[0] * math.sin(az1)
+    y = p1[1] + t[0] * math.cos(az1)
+
+    return x, y
+
+
+def utm_ke_longlat(point):
+
+    gseries = gpd.GeoSeries([point], crs=gdf.crs)
+    gseries_ll = gseries.to_crs(epsg=4326)
+
+    lon = gseries_ll.geometry[0].x
+    lat = gseries_ll.geometry[0].y
+
+    return lat, lon
+
+
+# ================== PLOT KONTUR CEPAT ==================
+
+def plot_kontur(titik_list, garis_list, teks_list, nama_file):
+
+    fig, ax = plt.subplots(figsize=(10,10))
+
+    x = gdf.geometry.x.values
+    y = gdf.geometry.y.values
+    z = gdf["grid_code"].values
+
+    grid_x, grid_y = np.mgrid[
+        minx:maxx:150j,
+        miny:maxy:150j
+    ]
+
+    grid_z = griddata(
+        (x, y),
+        z,
+        (grid_x, grid_y),
+        method='cubic'
+    )
+
+    kontur = ax.contourf(
+        grid_x,
+        grid_y,
+        grid_z,
+        cmap="terrain",
+        levels=15
+    )
+
+    plt.colorbar(kontur, ax=ax, label="Elevasi")
+
+    # ===== RINTANGAN TAMBAHAN =====
+    # ===== PENANDA DAERAH =====
+    for poly, warna, label in penanda_list:
+
+        xs, ys = poly.exterior.xy
+        ax.fill(xs, ys, color=warna, alpha=0.3, zorder=5)
+
+        c = poly.centroid
+        ax.text(c.x, c.y, label,
+                color='white',
+                weight='bold',
+                ha='center',
+                zorder=6)
+    for jenis, obj in rintangan_list:
+
+        if jenis == "titik":
+            ax.scatter(obj.x, obj.y, color='black', s=70, marker='x', zorder=6)
+
+        elif jenis == "garis":
+            xs, ys = obj.xy
+            ax.plot(xs, ys, color='black', linewidth=3, zorder=6)
+
+        elif jenis == "luas":
+            xs, ys = obj.exterior.xy
+            ax.fill(xs, ys, color='black', alpha=0.4, zorder=6)
+    
+    # ===== PLOT DISKRET =====
+    for d in diskret_points:
+
+        p = d["point"]
+
+        if d["status"] == "AMAN":
+            color = "gray"
+            size = 3
+        else:
+            color = "red"
+            size = 6
+
+        ax.scatter(p.x, p.y, color=color, s=size, zorder=4)
+
+    # TITIK
+    for titik, label in titik_list:
+        ax.scatter(titik.x, titik.y, color='red', s=40, zorder=7)
+        ax.text(titik.x, titik.y, label,
+                fontsize=9,
+                color='red',
+                weight='bold')
+
+    # GARIS
+    for garis in garis_list:
+        xs, ys = garis.xy
+        ax.plot(xs, ys, color='blue', linewidth=2)
+
+    # TEKS
+    for teks in teks_list:
+        ax.text(
+            teks[0],
+            teks[1],
+            teks[2],
+            color='yellow',
+            fontsize=9,
+            bbox=dict(facecolor='black', alpha=0.7, pad=3)
+        )
+
+    ax.set_aspect('equal')
+    ax.set_xlabel("Koordinat X (m)")
+    ax.set_ylabel("Koordinat Y (m)")
+
+    plt.title("Peta Kontur - Ilmu Medan (Optimasi)")
+    
+    plt.savefig(nama_file, dpi=300, bbox_inches='tight')
+    simpan_csv_diskret("diskretisasi_terbaru.csv")
+    plt.show()
+
+
+
+# ================== PLOT SATELIT ==================
+
+def plot_satelit(titik_list, garis_list, teks_list, nama_file):
+
+    fig, ax = plt.subplots(figsize=(10,10))
+
+    ax.set_xlim(minx_web, maxx_web)
+    ax.set_ylim(miny_web, maxy_web)
+
+    ctx.add_basemap(
+        ax,
+        source=ctx.providers.Esri.WorldImagery,
+        crs="EPSG:3857"
+    )
+
+    # ===== RINTANGAN TAMBAHAN =====
+    # ===== PENANDA DAERAH =====
+    for poly, warna, label in penanda_list:
+
+        poly_web = gpd.GeoSeries([poly], crs=gdf.crs).to_crs(epsg=3857)
+        geom = poly_web.geometry[0]
+
+        xs, ys = geom.exterior.xy
+        ax.fill(xs, ys, color=warna, alpha=0.3, zorder=5)
+
+        c = geom.centroid
+        ax.text(c.x, c.y, label,
+                color='white',
+                weight='bold',
+                ha='center',
+                zorder=6)
+    for jenis, obj in rintangan_list:
+
+        obj_web = gpd.GeoSeries([obj], crs=gdf.crs).to_crs(epsg=3857)
+        geom = obj_web.geometry[0]
+
+        if jenis == "titik":
+            ax.scatter(geom.x, geom.y, color='black', s=70, marker='x', zorder=6)
+
+        elif jenis == "garis":
+            xs, ys = geom.xy
+            ax.plot(xs, ys, color='black', linewidth=3, zorder=6)
+
+        elif jenis == "luas":
+            xs, ys = geom.exterior.xy
+            ax.fill(xs, ys, color='black', alpha=0.4, zorder=6)
+            
+    # ===== PLOT DISKRET =====
+    for d in diskret_points:
+
+        p_web = gpd.GeoSeries([d["point"]], crs=gdf.crs).to_crs(epsg=3857)
+
+        geom = p_web.geometry[0]
+
+        if d["status"] == "AMAN":
+            color = "gray"
+            size = 3
+        else:
+            color = "red"
+            size = 6
+
+        ax.scatter(geom.x, geom.y, color=color, s=size, zorder=4)
+
+    for titik, label in titik_list:
+
+        titik_web = gpd.GeoSeries([titik], crs=gdf.crs).to_crs(epsg=3857)
+
+        x, y = titik_web.geometry[0].x, titik_web.geometry[0].y
+
+        ax.scatter(x, y, color='red', zorder=7)
+        ax.text(x, y, label, fontsize=9, color='yellow')
+
+    for garis in garis_list:
+
+        garis_web = gpd.GeoSeries([garis], crs=gdf.crs).to_crs(epsg=3857)
+
+        xs, ys = garis_web.geometry[0].xy
+
+        ax.plot(xs, ys, color='cyan', linewidth=2)
+
+    plt.title("Peta Satelit - Ilmu Medan")
+
+    plt.savefig(nama_file, dpi=300, bbox_inches='tight')
+    simpan_csv_diskret("diskretisasi_terbaru.csv")
+    plt.show()
+
+
+def simpan_laporan(nama_file, isi):
+
+    with open(nama_file, "w") as f:
+        f.write(isi)
+
+
+# ================== MENU ==================
+
+while True:
+
+    print("\n===== PROGRAM ILMU MEDAN DIGITAL =====")
+    print("1. Hitung Azimuth & Jarak")
+    print("2. Resection Otomatis")
+    print("3. Tambah Rintangan")   # <<< TAMBAHAN
+    print("4. Tambah Penanda Daerah")
+    print("5. Cari Jalur Aman")
+    print("0. Keluar")
+
+    pilihan = input("Pilih menu: ")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # ================= AZIMUTH =================
+    if pilihan == "1":
+
+        while True:
+            x1 = float(input("X awal: "))
+            y1 = float(input("Y awal: "))
+            if validasi_titik(x1, y1):
+                break
+
+        while True:
+            x2 = float(input("X tujuan: "))
+            y2 = float(input("Y tujuan: "))
+            if validasi_titik(x2, y2):
+                break
+
+        az_deg, az_mil, jarak = hitung_azimuth_jarak(x1, y1, x2, y2)
+
+        p1 = Point(x1, y1)
+        p2 = Point(x2, y2)
+
+        lat1, lon1 = utm_ke_longlat(p1)
+        lat2, lon2 = utm_ke_longlat(p2)
+
+        print(f"\nAzimuth: {az_deg:.2f}° / {az_mil:.2f} mil")
+        print(f"Jarak  : {jarak:.2f} meter")
+
+        print("\n=== LONG LAT (WGS84) ===")
+        print(f"Titik Awal  : {lat1:.6f}, {lon1:.6f}")
+        print(f"Titik Tujuan: {lat2:.6f}, {lon2:.6f}")
+
+        garis = LineString([p1, p2])
+
+        titik_data = [(p1, "Titik Awal"), (p2, "Titik Tujuan")]
+        garis_data = [garis]
+
+        teks_data = [(
+            (x1+x2)/2,
+            (y1+y2)/2,
+            f"{az_deg:.1f}° / {az_mil:.0f} mil"
+        )]
+
+        plot_kontur(titik_data, garis_data, teks_data,
+                    f"hasil_kontur_{timestamp}.png")
+
+        plot_satelit(titik_data, garis_data, teks_data,
+                     f"hasil_satelit_{timestamp}.png")
+
+    # ================= RESECTION =================
+    elif pilihan == "2":
+
+        while True:
+            x1 = float(input("X objek 1: "))
+            y1 = float(input("Y objek 1: "))
+            if validasi_titik(x1, y1):
+                break
+    
+        while True:
+            az1 = float(input("Azimuth ke objek 1: "))
+            if validasi_azimuth(az1):
+                break
+    
+        while True:
+            x2 = float(input("X objek 2: "))
+            y2 = float(input("Y objek 2: "))
+            if validasi_titik(x2, y2):
+                break
+    
+        while True:
+            az2 = float(input("Azimuth ke objek 2: "))
+            if validasi_azimuth(az2):
+                break
+
+        baz1 = back_azimuth(az1)
+        baz2 = back_azimuth(az2)
+
+        x, y = intersection((x1, y1), baz1, (x2, y2), baz2)
+
+        pA = Point(x1, y1)
+        pB = Point(x2, y2)
+        pPos = Point(x, y)
+
+        print(f"\nHasil Resection (UTM): X={x:.2f}, Y={y:.2f}")
+
+        titik_data = [
+            (pA, "Objek 1"),
+            (pB, "Objek 2"),
+            (pPos, "Posisi Anda")
+        ]
+
+        garis_data = [
+            LineString([pA, pPos]),
+            LineString([pB, pPos])
+        ]
+
+        plot_kontur(titik_data, garis_data, [],
+                    f"hasil_resection_kontur_{timestamp}.png")
+
+        plot_satelit(titik_data, garis_data, [],
+                     f"hasil_resection_satelit_{timestamp}.png")
+
+    elif pilihan == "3":
+
+        tambah_rintangan()
+        update_status_diskret()
+        tandai_titik_curam()   # <<< TAMBAHAN WAJIB
+
+        plot_kontur([], [], [],
+                    f"rintangan_kontur_{timestamp}.png")
+
+        plot_satelit([], [], [],
+                     f"rintangan_satelit_{timestamp}.png")
+
+    elif pilihan == "4":
+
+        tambah_penanda_daerah()
+        update_status_diskret()
+        tandai_titik_curam()   # <<< TAMBAHAN WAJIB
+    
+        plot_kontur([], [], [],
+                    f"penanda_kontur_{timestamp}.png")
+    
+        plot_satelit([], [], [],
+                     f"penanda_satelit_{timestamp}.png")
+        # ================= JALUR AMAN =================
+    elif pilihan == "5":
+
+        # ===== INPUT TITIK AWAL (UTM) =====
+        while True:
+            try:
+                x1 = float(input("X awal (UTM meter): "))
+                y1 = float(input("Y awal (UTM meter): "))
+
+                if validasi_titik(x1, y1):
+                    p_awal = Point(x1, y1)
+                    break
+                else:
+                    print("❌ Titik di luar area peta! Ulangi input.")
+
+            except:
+                print("❌ Input salah!")
+
+        # ===== INPUT TITIK TUJUAN (UTM) =====
+        while True:
+            try:
+                x2 = float(input("X tujuan (UTM meter): "))
+                y2 = float(input("Y tujuan (UTM meter): "))
+
+                if validasi_titik(x2, y2):
+                    p_tujuan = Point(x2, y2)
+                    break
+                else:
+                    print("❌ Titik di luar area peta! Ulangi input.")
+
+            except:
+                print("❌ Input salah!")
+
+        # ===== CARI GRID TERDEKAT =====
+        start_node = cari_grid_terdekat(p_awal.x, p_awal.y)
+        end_node = cari_grid_terdekat(p_tujuan.x, p_tujuan.y)
+
+        print("⏳ Mencari jalur aman...")
+
+        path = cari_jalur_aman(start_node, end_node)
+
+        if path is None or len(path) == 0:
+            print("❌ Jalur tidak ditemukan!")
+            continue
+
+        print(f"✅ Jalur ditemukan dengan {len(path)} titik")
+
+        # ===== BUAT GARIS =====
+        garis = LineString(path)
+
+        titik_data = [
+            (p_awal, "Start"),
+            (p_tujuan, "Finish")
+        ]
+
+        garis_data = [garis]
+
+        plot_kontur(
+            titik_data,
+            garis_data,
+            [],
+            f"jalur_aman_kontur_{timestamp}.png"
+        )
+
+        plot_satelit(
+            titik_data,
+            garis_data,
+            [],
+            f"jalur_aman_satelit_{timestamp}.png"
+        )
+    elif pilihan == "0":
+        break
+
+print("Program selesai.")
